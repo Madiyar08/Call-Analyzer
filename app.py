@@ -1,0 +1,550 @@
+import streamlit as st
+import pandas as pd
+import io
+import os
+from datetime import datetime
+import requests
+
+st.set_page_config(
+    page_title="Отчёт операторов",
+    page_icon="📊",
+    layout="wide"
+)
+
+TIME_SLOTS = [
+    "00:00-01:00", "01:00-02:00", "02:00-03:00", "03:00-04:00",
+    "04:00-05:00", "05:00-06:00", "06:00-07:00", "07:00-08:00",
+    "08:00-09:00", "09:00-10:00", "10:00-11:00", "11:00-12:00",
+    "12:00-13:00", "13:00-14:00", "14:00-15:00", "15:00-16:00",
+    "16:00-17:00", "17:00-18:00", "18:00-19:00", "19:00-20:00",
+    "20:00-21:00", "21:00-22:00", "22:00-23:00", "23:00-00:00"
+]
+
+
+def get_google_sheets_credentials():
+    """Fetch fresh credentials from Replit connector."""
+    hostname = os.environ.get('REPLIT_CONNECTORS_HOSTNAME')
+    repl_identity = os.environ.get('REPL_IDENTITY')
+    web_repl_renewal = os.environ.get('WEB_REPL_RENEWAL')
+    
+    if repl_identity:
+        x_replit_token = f'repl {repl_identity}'
+    elif web_repl_renewal:
+        x_replit_token = f'depl {web_repl_renewal}'
+    else:
+        return None, "Токен авторизации не найден"
+    
+    try:
+        response = requests.get(
+            f'https://{hostname}/api/v2/connection?include_secrets=true&connector_names=google-sheet',
+            headers={
+                'Accept': 'application/json',
+                'X_REPLIT_TOKEN': x_replit_token
+            }
+        )
+        data = response.json()
+        connection_settings = data.get('items', [{}])[0] if data.get('items') else {}
+        
+        settings = connection_settings.get('settings', {})
+        oauth_data = settings.get('oauth', {}).get('credentials', {})
+        
+        access_token = settings.get('access_token') or oauth_data.get('access_token')
+        refresh_token = oauth_data.get('refresh_token')
+        client_id = oauth_data.get('client_id')
+        client_secret = oauth_data.get('client_secret')
+        
+        if not access_token:
+            return None, "Google Sheets не подключен"
+        
+        return {
+            'access_token': access_token,
+            'refresh_token': refresh_token,
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'token_uri': 'https://oauth2.googleapis.com/token'
+        }, None
+        
+    except Exception as e:
+        return None, f"Ошибка подключения: {str(e)}"
+
+
+def get_google_sheets_client():
+    """Get authenticated Google Sheets client using Replit connector."""
+    creds_data, error = get_google_sheets_credentials()
+    if error:
+        return None, error
+    
+    try:
+        import gspread
+        from google.oauth2.credentials import Credentials
+        
+        creds = Credentials(
+            token=creds_data['access_token'],
+            refresh_token=creds_data.get('refresh_token'),
+            token_uri=creds_data.get('token_uri'),
+            client_id=creds_data.get('client_id'),
+            client_secret=creds_data.get('client_secret'),
+            scopes=[
+                'https://www.googleapis.com/auth/spreadsheets',
+                'https://www.googleapis.com/auth/drive.file'
+            ]
+        )
+        
+        client = gspread.authorize(creds)
+        return client, None
+        
+    except Exception as e:
+        return None, f"Ошибка подключения: {str(e)}"
+
+
+def parse_call_data(df):
+    """Parse raw call data from the manager's file format."""
+    df = df.copy()
+    
+    if df.iloc[0, 0] == 'Дата':
+        df = df.iloc[1:].reset_index(drop=True)
+    
+    col_mapping = {}
+    original_cols = df.columns.tolist()
+    
+    for i, col in enumerate(original_cols):
+        col_str = str(col).lower()
+        if 'дата' in col_str and 'время' in col_str:
+            col_mapping['date'] = col
+            if i + 1 < len(original_cols):
+                col_mapping['time'] = original_cols[i + 1]
+            if i + 2 < len(original_cols):
+                col_mapping['result'] = original_cols[i + 2]
+    
+    for i, col in enumerate(original_cols):
+        col_str = str(col).lower()
+        if 'первый оператор' in col_str:
+            if i + 1 < len(original_cols):
+                col_mapping['operator_name'] = original_cols[i + 1]
+            break
+    
+    return df, col_mapping
+
+
+def get_hour_from_time(time_val):
+    """Extract hour from time value."""
+    if pd.isna(time_val):
+        return None
+    try:
+        time_str = str(time_val)
+        if ':' in time_str:
+            parts = time_str.split(':')
+            hour = int(parts[0])
+            if 0 <= hour <= 23:
+                return hour
+        return None
+    except:
+        return None
+
+
+def is_lost_call(result):
+    """Check if call result indicates a lost call."""
+    if pd.isna(result):
+        return False
+    result_lower = str(result).lower().strip()
+    return result_lower == 'потерян' or 'потерян' in result_lower
+
+
+def is_answered_call(result):
+    """Check if call result indicates an answered call."""
+    if pd.isna(result):
+        return False
+    result_lower = str(result).lower().strip()
+    return 'обработан первым оператором' in result_lower or 'обработан вторым оператором' in result_lower or 'обработан последним оператором' in result_lower
+
+
+def create_hourly_report(df, col_mapping):
+    """Create hourly report from parsed call data."""
+    df = df.copy()
+    
+    date_col = col_mapping.get('date')
+    time_col = col_mapping.get('time')
+    result_col = col_mapping.get('result')
+    operator_col = col_mapping.get('operator_name')
+    
+    if not all([date_col, time_col, result_col]):
+        return None, "Не удалось определить колонки данных"
+    
+    df['_hour'] = df[time_col].apply(get_hour_from_time)
+    df['_is_lost'] = df[result_col].apply(is_lost_call)
+    df['_is_answered'] = df[result_col].apply(is_answered_call)
+    
+    try:
+        df['_date'] = pd.to_datetime(df[date_col], format='%d.%m.%Y', errors='coerce').dt.date
+    except:
+        df['_date'] = df[date_col]
+    
+    dates = sorted(df['_date'].dropna().unique())
+    
+    results = []
+    
+    for time_slot in TIME_SLOTS:
+        row = {'Время': time_slot}
+        start_hour = int(time_slot.split(':')[0])
+        
+        for date in dates:
+            date_mask = df['_date'] == date
+            hour_mask = df['_hour'] == start_hour
+            filtered = df[date_mask & hour_mask]
+            
+            lost_count = int(filtered['_is_lost'].sum())
+            answered_count = int(filtered['_is_answered'].sum())
+            
+            operator_count = 0
+            if operator_col and operator_col in df.columns:
+                operators = filtered[operator_col].dropna()
+                operators = operators[operators.astype(str).str.strip() != '']
+                operators = operators[operators.astype(str) != '+']
+                operator_count = operators.nunique()
+            
+            date_str = date.strftime('%d.%m.%y') if hasattr(date, 'strftime') else str(date)
+            
+            row[f'{date_str}_Потерянные'] = lost_count
+            row[f'{date_str}_Принятые'] = answered_count
+            row[f'{date_str}_Оператор'] = operator_count
+        
+        results.append(row)
+    
+    totals = {'Время': 'Итог'}
+    if results:
+        for col in results[0].keys():
+            if col != 'Время':
+                totals[col] = sum(row[col] for row in results)
+    results.append(totals)
+    
+    return pd.DataFrame(results), None
+
+
+def create_operator_stats(df, col_mapping):
+    """Create statistics per operator - answered and lost calls."""
+    df = df.copy()
+    
+    result_col = col_mapping.get('result')
+    operator_col = col_mapping.get('operator_name')
+    
+    if not result_col or not operator_col:
+        return None
+    
+    df['_is_lost'] = df[result_col].apply(is_lost_call)
+    df['_is_answered'] = df[result_col].apply(is_answered_call)
+    
+    operator_data = df[operator_col].dropna()
+    operator_data = operator_data[operator_data.astype(str).str.strip() != '']
+    operator_data = operator_data[operator_data.astype(str) != '+']
+    operator_data = operator_data[~operator_data.astype(str).str.lower().str.contains('nan')]
+    
+    operators = operator_data.unique()
+    
+    results = []
+    for operator in operators:
+        operator_mask = df[operator_col] == operator
+        operator_calls = df[operator_mask]
+        
+        answered = int(operator_calls['_is_answered'].sum())
+        lost = int(operator_calls['_is_lost'].sum())
+        total = answered + lost
+        
+        if total > 0:
+            results.append({
+                'Оператор': operator,
+                'Принятые': answered,
+                'Потерянные': lost,
+                'Всего': total,
+                '% принятых': round((answered / total) * 100, 1) if total > 0 else 0
+            })
+    
+    if not results:
+        return None
+    
+    result_df = pd.DataFrame(results)
+    result_df = result_df.sort_values('Всего', ascending=False).reset_index(drop=True)
+    
+    return result_df
+
+
+def create_operator_hourly_report(df, col_mapping):
+    """Create hourly report per operator - calls per hour for each operator."""
+    df = df.copy()
+    
+    date_col = col_mapping.get('date')
+    time_col = col_mapping.get('time')
+    result_col = col_mapping.get('result')
+    operator_col = col_mapping.get('operator_name')
+    
+    if not all([date_col, time_col, result_col, operator_col]):
+        return None
+    
+    df['_hour'] = df[time_col].apply(get_hour_from_time)
+    df['_is_answered'] = df[result_col].apply(is_answered_call)
+    
+    try:
+        df['_date'] = pd.to_datetime(df[date_col], format='%d.%m.%Y', errors='coerce').dt.date
+    except:
+        df['_date'] = df[date_col]
+    
+    operator_data = df[operator_col].dropna()
+    operator_data = operator_data[operator_data.astype(str).str.strip() != '']
+    operator_data = operator_data[operator_data.astype(str) != '+']
+    operator_data = operator_data[~operator_data.astype(str).str.lower().str.contains('nan')]
+    operators = sorted(operator_data.unique())
+    
+    if not operators:
+        return None
+    
+    dates = sorted(df['_date'].dropna().unique())
+    
+    all_reports = {}
+    
+    for date in dates:
+        date_str = date.strftime('%d.%m.%Y') if hasattr(date, 'strftime') else str(date)
+        results = []
+        
+        for time_slot in TIME_SLOTS:
+            row = {date_str: time_slot}
+            start_hour = int(time_slot.split(':')[0])
+            
+            date_mask = df['_date'] == date
+            hour_mask = df['_hour'] == start_hour
+            
+            for operator in operators:
+                operator_mask = df[operator_col] == operator
+                filtered = df[date_mask & hour_mask & operator_mask]
+                call_count = int(filtered['_is_answered'].sum())
+                row[operator] = call_count
+            
+            results.append(row)
+        
+        totals = {date_str: 'Итог'}
+        for operator in operators:
+            totals[operator] = sum(row[operator] for row in results)
+        results.append(totals)
+        
+        all_reports[date_str] = pd.DataFrame(results)
+    
+    return all_reports
+
+
+def export_to_google_sheets(df, spreadsheet_name):
+    """Export dataframe to Google Sheets."""
+    client, error = get_google_sheets_client()
+    if error:
+        return None, error
+    
+    try:
+        try:
+            spreadsheet = client.open(spreadsheet_name)
+            worksheet = spreadsheet.sheet1
+            worksheet.clear()
+        except:
+            spreadsheet = client.create(spreadsheet_name)
+            worksheet = spreadsheet.sheet1
+        
+        headers = df.columns.tolist()
+        worksheet.append_row(headers)
+        
+        for _, row in df.iterrows():
+            row_values = [str(v) if pd.notna(v) else "" for v in row.tolist()]
+            worksheet.append_row(row_values)
+        
+        return spreadsheet.url, None
+        
+    except Exception as e:
+        return None, f"Ошибка экспорта: {str(e)}"
+
+
+def convert_df_to_excel(df):
+    """Convert dataframe to Excel bytes."""
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Отчёт')
+        
+        workbook = writer.book
+        worksheet = writer.sheets['Отчёт']
+        
+        header_format = workbook.add_format({
+            'bold': True,
+            'bg_color': '#4CAF50',
+            'font_color': 'white',
+            'border': 1
+        })
+        
+        for col_num, value in enumerate(df.columns.values):
+            worksheet.write(0, col_num, value, header_format)
+            worksheet.set_column(col_num, col_num, 15)
+    
+    return output.getvalue()
+
+
+st.title("📊 Отчёт операторов по звонкам")
+st.markdown("Автоматизация ежедневного отчёта по звонкам операторов")
+
+uploaded_file = st.file_uploader(
+    "📁 Загрузите файл от менеджера (.xls или .xlsx)",
+    type=['xls', 'xlsx'],
+    help="Поддерживаются форматы Excel: .xls и .xlsx"
+)
+
+if uploaded_file:
+    try:
+        if uploaded_file.name.endswith('.xls'):
+            df = pd.read_excel(uploaded_file, engine='xlrd')
+        else:
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
+        
+        st.success(f"Файл загружен: {uploaded_file.name} ({len(df)} записей)")
+        
+        with st.expander("📋 Исходные данные (первые 20 строк)", expanded=False):
+            st.dataframe(df.head(20), use_container_width=True)
+        
+        parsed_df, col_mapping = parse_call_data(df)
+        
+        st.info(f"Найдены колонки: Дата={col_mapping.get('date')}, Время={col_mapping.get('time')}, Результат={col_mapping.get('result')}")
+        
+        report_df, error = create_hourly_report(parsed_df, col_mapping)
+        
+        if error:
+            st.error(f"Ошибка: {error}")
+        else:
+            st.subheader("📊 Отчёт по часам")
+            st.dataframe(report_df, use_container_width=True, height=700)
+            
+            st.subheader("📈 Статистика")
+            
+            numeric_cols = [c for c in report_df.columns if c != 'Время']
+            totals_row = report_df[report_df['Время'] == 'Итог']
+            
+            lost_cols = [c for c in numeric_cols if 'Потерянные' in c]
+            answered_cols = [c for c in numeric_cols if 'Принятые' in c]
+            
+            if not totals_row.empty:
+                col1, col2, col3 = st.columns(3)
+                
+                if lost_cols:
+                    total_lost = totals_row[lost_cols].sum(axis=1).values[0]
+                    col1.metric("🔴 Всего потеряно", int(total_lost))
+                
+                if answered_cols:
+                    total_answered = totals_row[answered_cols].sum(axis=1).values[0]
+                    col2.metric("🟢 Всего принято", int(total_answered))
+                
+                if lost_cols and answered_cols:
+                    total_calls = total_lost + total_answered
+                    if total_calls > 0:
+                        success_rate = (total_answered / total_calls) * 100
+                        col3.metric("📊 Процент ответов", f"{success_rate:.1f}%")
+            
+            st.subheader("📊 Диаграммы")
+            
+            chart_data = report_df[report_df['Время'] != 'Итог'].copy()
+            
+            if lost_cols and answered_cols:
+                chart_df = pd.DataFrame({
+                    'Время': chart_data['Время'],
+                    'Потерянные': chart_data[lost_cols].sum(axis=1),
+                    'Принятые': chart_data[answered_cols].sum(axis=1)
+                })
+                chart_df = chart_df.set_index('Время')
+                
+                st.markdown("#### Звонки по часам (все даты)")
+                st.bar_chart(chart_df, color=["#ff4b4b", "#4CAF50"])
+                
+                st.markdown("#### Соотношение принятых и потерянных")
+                pie_data = pd.DataFrame({
+                    'Тип': ['Принятые', 'Потерянные'],
+                    'Количество': [int(total_answered), int(total_lost)]
+                })
+                
+                col1, col2 = st.columns([1, 2])
+                with col1:
+                    st.dataframe(pie_data, hide_index=True)
+                with col2:
+                    chart_df_pie = pie_data.set_index('Тип')
+                    st.bar_chart(chart_df_pie, color=["#4CAF50"])
+            
+            st.subheader("👤 Статистика по операторам")
+            
+            operator_stats = create_operator_stats(parsed_df, col_mapping)
+            
+            if operator_stats is not None and not operator_stats.empty:
+                st.dataframe(operator_stats, use_container_width=True, hide_index=True)
+                
+                st.markdown("#### Звонки по операторам")
+                op_chart_df = operator_stats[['Оператор', 'Принятые', 'Потерянные']].copy()
+                op_chart_df = op_chart_df.set_index('Оператор')
+                st.bar_chart(op_chart_df, color=["#4CAF50", "#ff4b4b"])
+            else:
+                st.warning("Не удалось определить статистику по операторам. Проверьте наличие колонки с именами операторов в файле.")
+            
+            st.subheader("📅 Звонки операторов по часам")
+            
+            operator_hourly = create_operator_hourly_report(parsed_df, col_mapping)
+            
+            if operator_hourly:
+                for date_str, date_df in operator_hourly.items():
+                    st.markdown(f"#### {date_str}")
+                    st.dataframe(date_df, use_container_width=True, hide_index=True)
+            else:
+                st.warning("Не удалось сформировать почасовой отчёт по операторам.")
+            
+            st.subheader("📤 Экспорт")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                st.markdown("### 💾 Скачать Excel")
+                excel_data = convert_df_to_excel(report_df)
+                st.download_button(
+                    label="📥 Скачать Excel файл",
+                    data=excel_data,
+                    file_name=f"отчет_операторов_{datetime.now().strftime('%d.%m.%Y')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            
+            with col2:
+                st.markdown("### 📊 Экспорт в Google Sheets")
+                sheet_name = st.text_input(
+                    "Название таблицы:",
+                    value=f"Отчёт операторов {datetime.now().strftime('%d.%m.%Y')}"
+                )
+                
+                if st.button("📤 Экспортировать в Google Sheets"):
+                    with st.spinner("Экспортируем в Google Sheets..."):
+                        url, error = export_to_google_sheets(report_df, sheet_name)
+                        if error:
+                            st.error(f"❌ {error}")
+                        else:
+                            st.success("Успешно экспортировано!")
+                            st.markdown(f"[🔗 Открыть таблицу]({url})")
+                        
+    except Exception as e:
+        st.error(f"Ошибка при обработке файла: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
+
+else:
+    st.info("👆 Загрузите файл .xls или .xlsx для начала работы")
+    
+    with st.expander("📖 Инструкция"):
+        st.markdown("""
+        ### Как использовать:
+        
+        1. **Загрузите файл** от менеджера (.xls или .xlsx)
+        
+        2. **Приложение автоматически**:
+           - Определит колонки с датой, временем, результатом и оператором
+           - Подсчитает потерянные и принятые звонки по каждому часу
+           - Посчитает количество операторов в каждый час
+           - Рассчитает итоги
+        
+        3. **Экспортируйте результат**:
+           - Скачайте как Excel файл
+           - Или отправьте в Google Sheets
+        
+        ### Формат времени:
+        Отчёт группирует звонки по 24 часовым интервалам (00:00-01:00, 01:00-02:00, и т.д.)
+        """)
