@@ -1,3 +1,4 @@
+import math
 import streamlit as st
 import pandas as pd
 import io
@@ -449,6 +450,156 @@ def create_fte_analysis(df, col_mapping):
     return result_df, None
 
 
+def generate_staffing_recommendations(fte_df):
+    """
+    Analyse FTE data and return a structured dict of staffing recommendations.
+    Works even without Occupancy (falls back to Required vs Actual comparison).
+    """
+    if fte_df is None or fte_df.empty:
+        return None
+
+    has_occ = fte_df['Occupancy %'].notna().any()
+    has_req = fte_df['Required FTE'].notna().any()
+
+    recs = {}
+
+    # ── 1. Overall assessment ────────────────────────────────────────────
+    active = fte_df[fte_df['Принятые'] > 0].copy()
+    if active.empty:
+        return None
+
+    avg_actual = active['Операторов (факт)'].mean()
+
+    if has_req:
+        active_req = active.dropna(subset=['Required FTE'])
+        avg_req = active_req['Required FTE'].mean() if not active_req.empty else None
+    else:
+        avg_req = None
+
+    if has_occ:
+        active_occ = active.dropna(subset=['Occupancy %'])
+        avg_occ = active_occ['Occupancy %'].mean() if not active_occ.empty else None
+    else:
+        avg_occ = None
+
+    recs['avg_actual'] = round(avg_actual, 1)
+    recs['avg_req'] = round(avg_req, 2) if avg_req else None
+    recs['avg_occ'] = round(avg_occ, 1) if avg_occ else None
+
+    if avg_req:
+        diff = avg_actual - avg_req
+        recs['overall_diff'] = round(diff, 1)
+        if diff > 0.5:
+            recs['overall_status'] = 'excess'
+            recs['overall_msg'] = (
+                f"В среднем операторов **больше, чем нужно** на **{diff:.1f} чел.**  "
+                f"(факт: {avg_actual:.1f}, нужно: {avg_req:.2f}).  "
+                f"Можно сократить смену или перераспределить часть операторов на другие часы."
+            )
+        elif diff < -0.5:
+            recs['overall_status'] = 'shortage'
+            recs['overall_msg'] = (
+                f"В среднем операторов **не хватает на {abs(diff):.1f} чел.**  "
+                f"(факт: {avg_actual:.1f}, нужно: {avg_req:.2f}).  "
+                f"Рекомендуется добавить операторов или перенести часть нагрузки."
+            )
+        else:
+            recs['overall_status'] = 'ok'
+            recs['overall_msg'] = (
+                f"Общее количество операторов соответствует нагрузке  "
+                f"(факт: {avg_actual:.1f}, нужно: {avg_req:.2f})."
+            )
+    elif avg_occ:
+        if avg_occ > 85:
+            recs['overall_status'] = 'shortage'
+            recs['overall_msg'] = f"Средняя загрузка **{avg_occ:.1f}%** — операторы перегружены. Нужно добавить людей."
+        elif avg_occ < 45:
+            recs['overall_status'] = 'excess'
+            recs['overall_msg'] = f"Средняя загрузка **{avg_occ:.1f}%** — операторов слишком много. Можно сократить."
+        else:
+            recs['overall_status'] = 'ok'
+            recs['overall_msg'] = f"Средняя загрузка **{avg_occ:.1f}%** — нагрузка в норме."
+    else:
+        recs['overall_status'] = 'nodata'
+        recs['overall_msg'] = "Нет данных о длительности звонков — точные рекомендации недоступны."
+
+    # ── 2. Problem hours (per hour slot, averaged across dates) ──────────
+    hour_group = active.groupby('Час').agg(
+        avg_actual=('Операторов (факт)', 'mean'),
+        avg_req=('Required FTE', 'mean'),
+        avg_occ=('Occupancy %', 'mean'),
+        total_calls=('Принятые', 'sum'),
+    ).reset_index()
+
+    shortage_hours = []
+    excess_hours = []
+
+    for _, row in hour_group.iterrows():
+        hour = row['Час']
+        act = row['avg_actual']
+        req = row['avg_req']
+        occ = row['avg_occ']
+        calls = row['total_calls']
+
+        if pd.notna(req):
+            diff = act - req
+            need = max(0, math.ceil(req - act))
+            remove = max(0, math.floor(act - req))
+            if diff < -0.3 and calls > 0:
+                shortage_hours.append({
+                    'Час': hour,
+                    'Факт': round(act, 1),
+                    'Нужно': round(req, 2),
+                    'Добавить': need,
+                    'Occupancy %': round(occ, 1) if pd.notna(occ) else None,
+                })
+            elif diff > 0.5 and calls > 0:
+                excess_hours.append({
+                    'Час': hour,
+                    'Факт': round(act, 1),
+                    'Нужно': round(req, 2),
+                    'Убрать': remove,
+                    'Occupancy %': round(occ, 1) if pd.notna(occ) else None,
+                })
+        elif pd.notna(occ):
+            if occ > 90 and calls > 0:
+                shortage_hours.append({
+                    'Час': hour,
+                    'Факт': round(act, 1),
+                    'Нужно': '?',
+                    'Добавить': '≥1',
+                    'Occupancy %': round(occ, 1),
+                })
+            elif occ < 40 and calls > 0:
+                excess_hours.append({
+                    'Час': hour,
+                    'Факт': round(act, 1),
+                    'Нужно': '?',
+                    'Убрать': '≥1',
+                    'Occupancy %': round(occ, 1),
+                })
+
+    recs['shortage_hours'] = shortage_hours
+    recs['excess_hours'] = excess_hours
+
+    # ── 3. Peak hours (top-3 by calls) ───────────────────────────────────
+    peak = hour_group.nlargest(3, 'total_calls')[['Час', 'total_calls', 'avg_actual', 'avg_req', 'avg_occ']]
+    recs['peak_hours'] = peak.to_dict('records')
+
+    # ── 4. Operator-level recommendations ────────────────────────────────
+    if has_occ:
+        date_summary = active.groupby('Дата').agg(
+            avg_occ=('Occupancy %', 'mean'),
+            avg_actual=('Операторов (факт)', 'mean'),
+            avg_req=('Required FTE', 'mean'),
+        ).reset_index()
+        recs['date_summary'] = date_summary.to_dict('records')
+    else:
+        recs['date_summary'] = []
+
+    return recs
+
+
 def export_to_google_sheets(df, spreadsheet_name):
     """Export dataframe to Google Sheets."""
     client, error = get_google_sheets_client()
@@ -680,9 +831,12 @@ if uploaded_file:
                         return 'background-color: #d4edda'
                     return 'background-color: #cce5ff'
 
-                styled = filtered_fte.style.applymap(
-                    color_occupancy, subset=['Occupancy %']
-                ).format({
+                styler = filtered_fte.style
+                try:
+                    styler = styler.map(color_occupancy, subset=['Occupancy %'])
+                except AttributeError:
+                    styler = styler.applymap(color_occupancy, subset=['Occupancy %'])
+                styled = styler.format({
                     'AHT (сек)': lambda x: f"{x:.0f}" if pd.notna(x) else "—",
                     'Required FTE': lambda x: f"{x:.2f}" if pd.notna(x) else "—",
                     'Occupancy %': lambda x: f"{x:.1f}%" if pd.notna(x) else "—",
@@ -723,6 +877,119 @@ if uploaded_file:
                     file_name=f"fte_анализ_{datetime.now().strftime('%d.%m.%Y')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
+
+                # ── STAFFING RECOMMENDATIONS ──────────────────────────────
+                st.subheader("💡 Выводы и рекомендации по штату")
+
+                recs = generate_staffing_recommendations(filtered_fte)
+
+                if recs is None:
+                    st.info("Недостаточно данных для формирования рекомендаций.")
+                else:
+                    # Overall verdict
+                    status = recs.get('overall_status', 'nodata')
+                    msg = recs.get('overall_msg', '')
+
+                    if status == 'shortage':
+                        st.error(f"🔴 **Общий вывод:** {msg}")
+                    elif status == 'excess':
+                        st.warning(f"🟡 **Общий вывод:** {msg}")
+                    elif status == 'ok':
+                        st.success(f"🟢 **Общий вывод:** {msg}")
+                    else:
+                        st.info(f"ℹ️ **Общий вывод:** {msg}")
+
+                    # Peak hours
+                    peak = recs.get('peak_hours', [])
+                    if peak:
+                        st.markdown("#### 📈 Пиковые часы нагрузки")
+                        peak_lines = []
+                        for p in peak:
+                            occ_str = f", загрузка {p['avg_occ']:.0f}%" if pd.notna(p.get('avg_occ')) else ""
+                            req_str = f", нужно {p['avg_req']:.1f} оп." if pd.notna(p.get('avg_req')) else ""
+                            peak_lines.append(
+                                f"- **{p['Час']}** — {int(p['total_calls'])} звонков, "
+                                f"факт {p['avg_actual']:.1f} оп.{req_str}{occ_str}"
+                            )
+                        st.markdown("\n".join(peak_lines))
+
+                    # Hours where operators are short
+                    shortage = recs.get('shortage_hours', [])
+                    if shortage:
+                        st.markdown("#### 🔴 Часы нехватки операторов — нужно **добавить**")
+                        rows_s = []
+                        for s in shortage:
+                            occ_str = f"{s['Occupancy %']:.1f}%" if s.get('Occupancy %') is not None else "—"
+                            rows_s.append({
+                                'Час': s['Час'],
+                                'Факт (чел.)': s['Факт'],
+                                'Нужно (чел.)': s['Нужно'],
+                                'Добавить (чел.)': s['Добавить'],
+                                'Occupancy %': occ_str,
+                            })
+                        st.dataframe(pd.DataFrame(rows_s), use_container_width=True, hide_index=True)
+                    else:
+                        st.success("✅ Часов с нехваткой операторов нет.")
+
+                    # Hours where operators are excess
+                    excess = recs.get('excess_hours', [])
+                    if excess:
+                        st.markdown("#### 🔵 Часы избытка операторов — можно **убрать**")
+                        rows_e = []
+                        for e in excess:
+                            occ_str = f"{e['Occupancy %']:.1f}%" if e.get('Occupancy %') is not None else "—"
+                            rows_e.append({
+                                'Час': e['Час'],
+                                'Факт (чел.)': e['Факт'],
+                                'Нужно (чел.)': e['Нужно'],
+                                'Убрать (чел.)': e['Убрать'],
+                                'Occupancy %': occ_str,
+                            })
+                        st.dataframe(pd.DataFrame(rows_e), use_container_width=True, hide_index=True)
+                    else:
+                        st.success("✅ Лишних операторов нет.")
+
+                    # By-date summary
+                    date_sum = recs.get('date_summary', [])
+                    if date_sum:
+                        st.markdown("#### 📅 Итог по дням")
+                        date_rows = []
+                        for d in date_sum:
+                            avg_occ = d.get('avg_occ')
+                            avg_req = d.get('avg_req')
+                            avg_act = d.get('avg_actual')
+
+                            if pd.notna(avg_occ):
+                                if avg_occ > 85:
+                                    verdict = "🔴 Перегрузка — добавить операторов"
+                                elif avg_occ > 70:
+                                    verdict = "🟡 Высокая нагрузка — близко к пределу"
+                                elif avg_occ > 40:
+                                    verdict = "🟢 Норма"
+                                else:
+                                    verdict = "🔵 Недозагруженность — можно сократить"
+                            else:
+                                verdict = "—"
+
+                            diff_str = "—"
+                            if pd.notna(avg_req) and pd.notna(avg_act):
+                                diff = avg_act - avg_req
+                                if diff > 0.5:
+                                    diff_str = f"Избыток +{diff:.1f} чел."
+                                elif diff < -0.5:
+                                    diff_str = f"Нехватка {diff:.1f} чел."
+                                else:
+                                    diff_str = "Баланс"
+
+                            date_rows.append({
+                                'Дата': d['Дата'],
+                                'Ср. загрузка': f"{avg_occ:.1f}%" if pd.notna(avg_occ) else "—",
+                                'Факт (ср.)': f"{avg_act:.1f}" if pd.notna(avg_act) else "—",
+                                'Нужно (ср.)': f"{avg_req:.1f}" if pd.notna(avg_req) else "—",
+                                'Баланс': diff_str,
+                                'Вывод': verdict,
+                            })
+                        st.dataframe(pd.DataFrame(date_rows), use_container_width=True, hide_index=True)
 
             # ─────────────────────────────────────────────────────────────
             st.subheader("📤 Экспорт")
