@@ -122,7 +122,15 @@ def parse_call_data(df):
             if i + 1 < len(original_cols):
                 col_mapping['operator_name'] = original_cols[i + 1]
             break
-    
+
+    # Detect duration column (длительность разговора)
+    duration_keywords = ['длительность', 'продолжительность', 'duration', 'talk time', 'время разговора', 'время обработки']
+    for col in original_cols:
+        col_str = str(col).lower()
+        if any(kw in col_str for kw in duration_keywords):
+            col_mapping['duration'] = col
+            break
+
     return df, col_mapping
 
 
@@ -329,6 +337,118 @@ def create_operator_hourly_report(df, col_mapping):
     return all_reports
 
 
+def parse_duration_seconds(val):
+    """Parse duration value to seconds. Supports HH:MM:SS, MM:SS, or raw seconds."""
+    if pd.isna(val):
+        return None
+    s = str(val).strip()
+    if ':' in s:
+        parts = s.split(':')
+        try:
+            if len(parts) == 3:
+                return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(float(parts[2]))
+            elif len(parts) == 2:
+                return int(parts[0]) * 60 + int(float(parts[1]))
+        except:
+            return None
+    try:
+        return float(s)
+    except:
+        return None
+
+
+def create_fte_analysis(df, col_mapping):
+    """
+    Create FTE and Occupancy analysis per hour across all dates.
+    """
+    df = df.copy()
+
+    date_col = col_mapping.get('date')
+    time_col = col_mapping.get('time')
+    result_col = col_mapping.get('result')
+    operator_col = col_mapping.get('operator_name')
+    duration_col = col_mapping.get('duration')
+
+    if not all([date_col, time_col, result_col]):
+        return None, "Не хватает колонок (дата/время/результат)"
+
+    df['_hour'] = df[time_col].apply(get_hour_from_time)
+    df['_is_answered'] = df[result_col].apply(is_answered_call)
+
+    try:
+        df['_date'] = pd.to_datetime(df[date_col], format='%d.%m.%Y', errors='coerce').dt.date
+    except:
+        df['_date'] = df[date_col]
+
+    if duration_col and duration_col in df.columns:
+        df['_duration_sec'] = df[duration_col].apply(parse_duration_seconds)
+    else:
+        df['_duration_sec'] = None
+
+    dates = sorted(df['_date'].dropna().unique())
+    rows = []
+
+    for date in dates:
+        date_str = date.strftime('%d.%m.%Y') if hasattr(date, 'strftime') else str(date)
+        date_mask = df['_date'] == date
+
+        for hour in range(24):
+            hour_mask = df['_hour'] == hour
+            slot = df[date_mask & hour_mask]
+            answered_slot = slot[slot['_is_answered']]
+
+            answered_count = int(answered_slot.shape[0])
+
+            actual_ops = 0
+            if operator_col and operator_col in df.columns:
+                ops = slot[operator_col].dropna()
+                ops = ops[ops.astype(str).str.strip().ne('') & ops.astype(str).ne('+')]
+                actual_ops = ops.nunique()
+
+            aht = None
+            if '_duration_sec' in df.columns and df['_duration_sec'].notna().any():
+                durations = answered_slot['_duration_sec'].dropna()
+                if len(durations) > 0:
+                    aht = durations.mean()
+
+            required_fte = None
+            if aht and answered_count > 0:
+                required_fte = round((answered_count * aht) / 3600, 2)
+
+            occupancy = None
+            if aht and actual_ops > 0 and answered_count > 0:
+                occupancy = round((answered_count * aht) / (actual_ops * 3600) * 100, 1)
+
+            status = ''
+            if occupancy is not None:
+                if occupancy > 90:
+                    status = '🔴 Перегрузка'
+                elif occupancy > 70:
+                    status = '🟡 Высокая'
+                elif occupancy > 40:
+                    status = '🟢 Норма'
+                elif answered_count > 0:
+                    status = '🔵 Недозагруженность'
+
+            rows.append({
+                'Дата': date_str,
+                'Час': f"{hour:02d}:00–{(hour+1)%24:02d}:00",
+                'Принятые': answered_count,
+                'Операторов (факт)': actual_ops,
+                'AHT (сек)': round(aht, 0) if aht else None,
+                'Required FTE': required_fte,
+                'Occupancy %': occupancy,
+                'Статус нагрузки': status,
+            })
+
+    result_df = pd.DataFrame(rows)
+    result_df = result_df[
+        (result_df['Принятые'] > 0) | (result_df['Операторов (факт)'] > 0)
+    ].reset_index(drop=True)
+
+    return result_df, None
+
+
 def export_to_google_sheets(df, spreadsheet_name):
     """Export dataframe to Google Sheets."""
     client, error = get_google_sheets_client()
@@ -491,6 +611,120 @@ if uploaded_file:
             else:
                 st.warning("Не удалось сформировать почасовой отчёт по операторам.")
             
+            # ── FTE & OCCUPANCY ANALYSIS ──────────────────────────────────
+            st.subheader("⚡ Анализ FTE и нагрузки операторов")
+
+            duration_col = col_mapping.get('duration')
+            if not duration_col:
+                st.warning(
+                    "Колонка с длительностью звонка не найдена автоматически. "
+                    "Выберите её вручную:"
+                )
+                all_cols = [c for c in parsed_df.columns if c not in col_mapping.values()]
+                duration_manual = st.selectbox(
+                    "Колонка с длительностью (сек / ЧЧ:ММ:СС):",
+                    options=["— не указывать —"] + list(parsed_df.columns),
+                    key="duration_col_select"
+                )
+                if duration_manual and duration_manual != "— не указывать —":
+                    col_mapping['duration'] = duration_manual
+
+            fte_df, fte_error = create_fte_analysis(parsed_df, col_mapping)
+
+            if fte_error:
+                st.error(f"Ошибка FTE: {fte_error}")
+            elif fte_df is None or fte_df.empty:
+                st.info("Нет данных для расчёта FTE.")
+            else:
+                has_aht = fte_df['AHT (сек)'].notna().any()
+                has_occ = fte_df['Occupancy %'].notna().any()
+
+                if not has_aht:
+                    st.info(
+                        "Длительность звонков не найдена — AHT и Occupancy не рассчитаны. "
+                        "Укажите колонку выше, чтобы получить полный анализ."
+                    )
+
+                # Summary metrics
+                col1, col2, col3, col4 = st.columns(4)
+                avg_aht = fte_df['AHT (сек)'].mean()
+                avg_occ = fte_df['Occupancy %'].mean()
+                avg_req = fte_df['Required FTE'].mean()
+                avg_act = fte_df['Операторов (факт)'].mean()
+
+                col1.metric("⏱ Средний AHT", f"{avg_aht:.0f} сек" if pd.notna(avg_aht) else "—")
+                col2.metric("📊 Средняя загрузка", f"{avg_occ:.1f}%" if pd.notna(avg_occ) else "—")
+                col3.metric("👥 Required FTE (ср.)", f"{avg_req:.2f}" if pd.notna(avg_req) else "—")
+                col4.metric("👤 Actual FTE (ср.)", f"{avg_act:.1f}" if pd.notna(avg_act) else "—")
+
+                # Filter controls
+                st.markdown("#### 📋 Детальная таблица по часам")
+                dates_available = sorted(fte_df['Дата'].unique())
+                selected_dates = st.multiselect(
+                    "Фильтр по дате:",
+                    options=dates_available,
+                    default=dates_available,
+                    key="fte_date_filter"
+                )
+                filtered_fte = fte_df[fte_df['Дата'].isin(selected_dates)] if selected_dates else fte_df
+
+                # Color occupancy column
+                def color_occupancy(val):
+                    if pd.isna(val):
+                        return ''
+                    if val > 90:
+                        return 'background-color: #ffcccc'
+                    elif val > 70:
+                        return 'background-color: #fff3cd'
+                    elif val > 40:
+                        return 'background-color: #d4edda'
+                    return 'background-color: #cce5ff'
+
+                styled = filtered_fte.style.applymap(
+                    color_occupancy, subset=['Occupancy %']
+                ).format({
+                    'AHT (сек)': lambda x: f"{x:.0f}" if pd.notna(x) else "—",
+                    'Required FTE': lambda x: f"{x:.2f}" if pd.notna(x) else "—",
+                    'Occupancy %': lambda x: f"{x:.1f}%" if pd.notna(x) else "—",
+                })
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+
+                # Charts
+                if has_occ and has_aht:
+                    st.markdown("#### 📈 Загрузка (Occupancy %) по часам")
+                    chart_occ = filtered_fte[['Час', 'Occupancy %', 'Дата']].dropna(subset=['Occupancy %'])
+                    if not chart_occ.empty:
+                        pivot_occ = chart_occ.pivot_table(
+                            index='Час', columns='Дата', values='Occupancy %', aggfunc='mean'
+                        )
+                        st.line_chart(pivot_occ)
+
+                if has_aht:
+                    st.markdown("#### 👥 Required FTE vs Actual FTE по часам")
+                    chart_fte = filtered_fte[['Час', 'Required FTE', 'Операторов (факт)']].dropna(subset=['Required FTE'])
+                    if not chart_fte.empty:
+                        pivot_fte = chart_fte.groupby('Час')[['Required FTE', 'Операторов (факт)']].mean()
+                        pivot_fte.columns = ['Required FTE (среднее)', 'Actual Operators (среднее)']
+                        st.line_chart(pivot_fte)
+
+                # Overload summary
+                st.markdown("#### 🔴 Часы с перегрузкой (Occupancy > 90%)")
+                overloaded = filtered_fte[filtered_fte['Occupancy %'] > 90]
+                if overloaded.empty:
+                    st.success("Перегруженных часов нет!")
+                else:
+                    st.dataframe(overloaded[['Дата', 'Час', 'Принятые', 'Операторов (факт)', 'Required FTE', 'Occupancy %']], use_container_width=True, hide_index=True)
+
+                # Excel download for FTE
+                fte_excel = convert_df_to_excel(filtered_fte)
+                st.download_button(
+                    label="📥 Скачать FTE-анализ в Excel",
+                    data=fte_excel,
+                    file_name=f"fte_анализ_{datetime.now().strftime('%d.%m.%Y')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
+            # ─────────────────────────────────────────────────────────────
             st.subheader("📤 Экспорт")
             
             col1, col2 = st.columns(2)
@@ -526,25 +760,138 @@ if uploaded_file:
         import traceback
         st.code(traceback.format_exc())
 
-else:
+# ── METHODOLOGY BLOCK — always visible at the bottom ──────────────────────────
+st.divider()
+with st.expander("📐 Методология расчётов — как считаются все показатели", expanded=False):
+    st.markdown("""
+## 📞 Основные показатели звонков
+
+### Принятые звонки
+Звонок считается **принятым**, если в колонке «Результат» содержится одно из значений:
+- `Обработан первым оператором`
+- `Обработан вторым оператором`
+- `Обработан последним оператором`
+
+### Потерянные звонки
+Звонок считается **потерянным**, если в колонке «Результат» содержится значение `Потерян`.
+
+### Процент ответов (Service Level по объёму)
+```
+% принятых = Принятые / (Принятые + Потерянные) × 100%
+```
+
+---
+
+## ⏱ AHT — Average Handle Time (среднее время обработки)
+
+AHT считается из колонки с длительностью звонка **только по принятым звонкам** за каждый часовой интервал:
+
+```
+AHT (сек) = Сумма длительностей принятых звонков в данном часу
+             ─────────────────────────────────────────────────
+             Количество принятых звонков в данном часу
+```
+
+Поддерживаемые форматы длительности в файле:
+- `ЧЧ:ММ:СС` (например, `00:03:45` = 225 секунд)
+- `ММ:СС` (например, `03:45` = 225 секунд)
+- Число в секундах (например, `225`)
+
+---
+
+## 👥 Required FTE — необходимое количество операторов
+
+Показывает, **сколько операторов теоретически нужно** для обработки фактического объёма звонков при данном AHT:
+
+```
+Required FTE = Принятые звонки (за час) × AHT (сек)
+               ──────────────────────────────────────
+                           3 600 сек
+```
+
+> Делитель 3 600 — это количество секунд в одном часе.  
+> Например: 40 звонков × 180 сек AHT / 3600 = **2.0 FTE**
+
+---
+
+## 📊 Occupancy % — загрузка (занятость) операторов
+
+Показывает, какую долю рабочего времени операторы фактически тратили на звонки:
+
+```
+Occupancy % = Принятые звонки × AHT (сек)
+              ────────────────────────────── × 100%
+              Операторов (факт) × 3 600 сек
+```
+
+> Например: 40 звонков × 180 сек / (3 оператора × 3600 сек) = **66.7%**
+
+### Интерпретация значений Occupancy:
+
+| Цвет | Диапазон | Статус | Комментарий |
+|------|----------|--------|-------------|
+| 🔴 Красный | > 90% | Перегрузка | Операторы не справляются, очередь растёт |
+| 🟡 Жёлтый | 70–90% | Высокая нагрузка | Рабочий режим, но близко к пределу |
+| 🟢 Зелёный | 40–70% | Норма | Оптимальная загрузка |
+| 🔵 Синий | < 40% | Недозагруженность | Операторов больше, чем нужно |
+
+---
+
+## 👤 Actual Operators (фактическое количество операторов)
+
+В каждом часовом интервале считается количество **уникальных операторов**, у которых был хотя бы один звонок (принятый или потерянный):
+
+```
+Actual Operators = COUNT DISTINCT (имя оператора) за данный час и дату
+```
+
+Пустые значения, символ `+` и `NaN` исключаются из подсчёта.
+
+---
+
+## 📅 FTE за период (по оператору)
+
+Для оценки нагрузки конкретного оператора за весь период:
+
+```
+% принятых оператора = Принятые звонки оператора
+                        ─────────────────────────────────────── × 100%
+                        (Принятые + Потерянные) оператора
+```
+
+---
+
+## 🔍 Примечания
+
+- Все расчёты ведутся **по каждому часовому интервалу отдельно** (00:00–01:00, 01:00–02:00, … 23:00–00:00)
+- Если в файле нет колонки с длительностью — AHT, Required FTE и Occupancy не рассчитываются
+- Строки с пустой датой или временем исключаются из расчётов
+- Required FTE и Occupancy считаются только для часов, где есть хотя бы один принятый звонок с известной длительностью
+    """)
+
+if not uploaded_file:
     st.info("👆 Загрузите файл .xls или .xlsx для начала работы")
-    
-    with st.expander("📖 Инструкция"):
+
+    with st.expander("📖 Инструкция по использованию"):
         st.markdown("""
         ### Как использовать:
-        
+
         1. **Загрузите файл** от менеджера (.xls или .xlsx)
-        
+
         2. **Приложение автоматически**:
            - Определит колонки с датой, временем, результатом и оператором
            - Подсчитает потерянные и принятые звонки по каждому часу
            - Посчитает количество операторов в каждый час
-           - Рассчитает итоги
-        
+           - Рассчитает итоги, AHT, Required FTE и Occupancy %
+
         3. **Экспортируйте результат**:
            - Скачайте как Excel файл
            - Или отправьте в Google Sheets
-        
+
         ### Формат времени:
-        Отчёт группирует звонки по 24 часовым интервалам (00:00-01:00, 01:00-02:00, и т.д.)
+        Отчёт группирует звонки по 24 часовым интервалам (00:00–01:00, 01:00–02:00, и т.д.)
+
+        ### Для расчёта FTE и нагрузки:
+        Убедитесь, что в файле есть колонка с длительностью звонка (в секундах или формате ЧЧ:ММ:СС).
+        Подробнее — в разделе «📐 Методология расчётов» ниже.
         """)
