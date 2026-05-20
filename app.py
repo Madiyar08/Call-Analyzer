@@ -672,8 +672,8 @@ PROJECT_CONFIG = {
     781500811:  {"name": "Trustbank",        "numbers": [781400088, 781500811]},
     787771414:  {"name": "Korzinka Business","numbers": [787771414, 931231414]},
     931231414:  {"name": "Korzinka Business","numbers": [787771414, 931231414]},
-    781506683:  {"name": "Другой проект",    "numbers": [781506683]},
-    781506686:  {"name": "Другой проект",    "numbers": [781506686]},
+    781506683:  {"name": "❓ Неизвестный (781506683)", "numbers": [781506683]},
+    781506686:  {"name": "❓ Неизвестный (781506686)", "numbers": [781506686]},
 }
 
 # IVR language codes: Набрано value → language
@@ -691,7 +691,7 @@ def get_project_name(number):
         num = int(str(number).replace('+', '').replace(' ', '').lstrip('0'))
     except:
         return "Неизвестно"
-    return PROJECT_CONFIG.get(num, {}).get("name", f"Неизвестно ({number})")
+    return PROJECT_CONFIG.get(num, {}).get("name", f"❓ Неизвестный ({num})")
 
 
 def parse_infini_file(uploaded):
@@ -907,7 +907,7 @@ def render_multiproject_analysis(infini_df, lang_df):
 
     if not hourly.empty:
         pivot_hour = hourly.pivot_table(index='Час', columns='Проект', values='Всего', fill_value=0)
-        pivot_hour.index = [f"{h:02d}:00" for h in pivot_hour.index]
+        pivot_hour.index = [f"{int(h):02d}:00" for h in pivot_hour.index]
         st.line_chart(pivot_hour)
 
         st.markdown("#### Таблица звонков по часам и проектам")
@@ -923,9 +923,12 @@ def render_multiproject_analysis(infini_df, lang_df):
         )
         ld = lang_df if lang_proj_sel == 'Все проекты' else lang_df[lang_df['Проект'] == lang_proj_sel]
         lang_hourly = ld.groupby(['Час', 'Язык']).size().reset_index(name='Звонков')
+        lang_hourly = lang_hourly[lang_hourly['Час'].notna()]
+        lang_hourly['Час'] = lang_hourly['Час'].apply(lambda x: int(x) if str(x).isdigit() or isinstance(x, (int, float)) else None)
+        lang_hourly = lang_hourly[lang_hourly['Час'].notna()]
         if not lang_hourly.empty:
             lang_h_pivot = lang_hourly.pivot_table(index='Час', columns='Язык', values='Звонков', fill_value=0)
-            lang_h_pivot.index = [f"{h:02d}:00" for h in lang_h_pivot.index]
+            lang_h_pivot.index = [f"{int(h):02d}:00" for h in lang_h_pivot.index]
             st.line_chart(lang_h_pivot)
 
     # ── Peak hours per project ────────────────────────────────────────────
